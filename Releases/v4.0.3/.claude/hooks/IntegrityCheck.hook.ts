@@ -19,21 +19,26 @@ interface HookInput {
 }
 
 async function readStdin(): Promise<HookInput | null> {
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   try {
     const decoder = new TextDecoder();
-    const reader = Bun.stdin.stream().getReader();
+    reader = Bun.stdin.stream().getReader();
     let input = '';
-    const timeout = new Promise<void>(r => setTimeout(r, 500));
+    const timeout = new Promise<void>(r => setTimeout(r, 2000));
     const read = (async () => {
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } = await reader!.read();
         if (done) break;
         input += decoder.decode(value, { stream: true });
       }
     })();
     await Promise.race([read, timeout]);
+    reader.cancel().catch(() => {});
     if (input.trim()) return JSON.parse(input) as HookInput;
-  } catch {}
+  } catch (err) {
+    console.error('[IntegrityCheck] readStdin:', err);
+    if (reader) reader.cancel().catch(() => {});
+  }
   return null;
 }
 
