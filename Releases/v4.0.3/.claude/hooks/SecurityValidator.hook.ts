@@ -17,7 +17,7 @@
  * OUTPUT:
  * - stdout: JSON decision object
  *   - {"continue": true} → Allow operation
- *   - {"decision": "ask", "message": "..."} → Prompt user for confirmation
+ *   - {hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "ask"}} → Prompt user
  * - exit(0): Normal completion (with decision)
  * - exit(2): Hard block (catastrophic operation prevented)
  *
@@ -128,9 +128,9 @@ function logSecurityEvent(event: SecurityEvent): void {
 
     const content = JSON.stringify(event, null, 2);
     writeFileSync(logPath, content);
-  } catch {
+  } catch (err) {
     // Logging failure should not block operations
-    console.error('Warning: Failed to log security event');
+    console.error('[SecurityValidator] logSecurityEvent:', err);
   }
 }
 
@@ -263,8 +263,9 @@ function matchesPattern(command: string, pattern: string): boolean {
   try {
     const regex = new RegExp(pattern, 'i');
     return regex.test(command);
-  } catch {
+  } catch (err) {
     // Invalid regex - try literal match
+    console.error('[SecurityValidator] matchesPattern invalid regex:', err);
     return command.toLowerCase().includes(pattern.toLowerCase());
   }
 }
@@ -294,7 +295,8 @@ function matchesPathPattern(filePath: string, pattern: string): boolean {
     try {
       const regex = new RegExp(`^${regexPattern}$`);
       return regex.test(expandedPath);
-    } catch {
+    } catch (err) {
+      console.error('[SecurityValidator] matchesPathPattern regex:', err);
       return false;
     }
   }
@@ -389,6 +391,60 @@ function validatePath(filePath: string, action: PathAction): { action: 'allow' |
 }
 
 // ========================================
+// Bash Path Extraction
+// ========================================
+
+/**
+ * Extract file paths from Bash commands that perform file writes.
+ * Catches common bypass vectors: bun/node -e with writeFileSync,
+ * shell redirections (> >>), cp/mv targets, tee, sed -i, etc.
+ *
+ * Not exhaustive — defense in depth, not perimeter.
+ */
+function extractWritePathsFromBash(command: string): string[] {
+  // Fast exit: skip commands that can't possibly write files
+  if (!/writeFileSync|>>?|[^|]\btee\b|\bsed\b.*-i|\bcp\b|\bmv\b/.test(command)) {
+    return [];
+  }
+
+  const paths: string[] = [];
+  const home = homedir();
+
+  // Strip heredoc bodies to avoid false positives on embedded path strings.
+  // Heredoc delimiters: << EOF ... EOF, << 'EOF' ... EOF, <<- EOF ... EOF
+  // The <<- variant allows indented closing delimiters.
+  const cmd = command.replace(/<<-?\s*'?(\w+)'?.*?\n[\s\S]*?\n\s*\1\b/g, '');
+
+  // writeFileSync / writeFile with string literal path
+  const wfsMatches = cmd.matchAll(/writeFileSync\s*\(\s*['"`]([^'"`]+)['"`]/g);
+  for (const m of wfsMatches) paths.push(m[1]);
+
+  // Shell redirections: > file, >> file
+  const redirectMatches = cmd.matchAll(/>{1,2}\s*['"]?([^\s;|&'"]+)/g);
+  for (const m of redirectMatches) paths.push(m[1]);
+
+  // tee target
+  const teeMatches = cmd.matchAll(/\btee\s+(?:-a\s+)?['"]?([^\s;|&'"]+)/g);
+  for (const m of teeMatches) paths.push(m[1]);
+
+  // sed -i (in-place edit)
+  const sedMatches = cmd.matchAll(/\bsed\s+-i[^\s]*\s+(?:'[^']*'|"[^"]*"|\S+)\s+['"]?([^\s;|&'"]+)/g);
+  for (const m of sedMatches) paths.push(m[1]);
+
+  // cp/mv target (last argument)
+  const cpMvMatches = cmd.matchAll(/\b(?:cp|mv)\s+(?:-[^\s]+\s+)*(?:\S+\s+)+['"]?([^\s;|&'"]+)/g);
+  for (const m of cpMvMatches) paths.push(m[1]);
+
+  // Resolve relative paths and ~ expansion
+  return paths.map(p => {
+    if (p.startsWith('~')) return p.replace('~', home);
+    if (p.startsWith('/')) return p;
+    // Relative paths — can't resolve reliably, include as-is
+    return p;
+  });
+}
+
+// ========================================
 // Tool-Specific Handlers
 // ========================================
 
@@ -405,6 +461,53 @@ function handleBash(input: HookInput): void {
   // Normalize: strip env var prefixes to prevent bypass (e.g., LANG=C rm -rf /)
   const command = stripEnvVarPrefix(rawCommand);
   const result = validateBashCommand(command);
+
+  // If command passes bash pattern checks, also check for file write bypass.
+  // Prevents: bun -e "writeFileSync('settings.json', ...)" bypassing Edit/Write guards.
+  if (result.action === 'allow') {
+    const writePaths = extractWritePathsFromBash(command);
+    for (const wp of writePaths) {
+      const pathResult = validatePath(wp, 'write');
+      if (pathResult.action === 'block') {
+        logSecurityEvent({
+          timestamp: new Date().toISOString(),
+          session_id: input.session_id,
+          event_type: 'block',
+          tool: 'Bash',
+          category: 'path_access',
+          target: wp,
+          pattern_matched: command.slice(0, 200),
+          reason: `Bash write to protected path: ${pathResult.reason}`,
+          action_taken: 'Hard block - exit 2'
+        });
+        console.error(`[PAI SECURITY] 🚨 BLOCKED: Bash write to protected path`);
+        console.error(`Path: ${wp}`);
+        console.error(`Command: ${command.slice(0, 200)}`);
+        process.exit(2);
+      }
+      if (pathResult.action === 'confirm') {
+        logSecurityEvent({
+          timestamp: new Date().toISOString(),
+          session_id: input.session_id,
+          event_type: 'confirm',
+          tool: 'Bash',
+          category: 'path_access',
+          target: wp,
+          pattern_matched: command.slice(0, 200),
+          reason: `Bash write to protected path: ${pathResult.reason}`,
+          action_taken: 'Prompted user for confirmation'
+        });
+        console.log(JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'ask'
+          },
+          message: `[PAI SECURITY] ⚠️ Bash command writes to protected path\n\nPath: ${wp}\nReason: ${pathResult.reason}\nCommand: ${command.slice(0, 200)}\n\nProceed?`
+        }));
+        return;
+      }
+    }
+  }
 
   switch (result.action) {
     case 'block':
@@ -435,7 +538,10 @@ function handleBash(input: HookInput): void {
         action_taken: 'Prompted user for confirmation'
       });
       console.log(JSON.stringify({
-        decision: 'ask',
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'ask'
+        },
         message: `[PAI SECURITY] ⚠️ ${result.reason}\n\nCommand: ${command.slice(0, 200)}\n\nProceed?`
       }));
       break;
@@ -502,7 +608,10 @@ function handleFileWrite(input: HookInput, toolName: string): void {
         action_taken: 'Prompted user for confirmation'
       });
       console.log(JSON.stringify({
-        decision: 'ask',
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'ask'
+        },
         message: `[PAI SECURITY] ⚠️ ${result.reason}\n\nPath: ${filePath}\n\nProceed?`
       }));
       break;
@@ -585,8 +694,9 @@ async function main(): Promise<void> {
     }
 
     input = JSON.parse(raw);
-  } catch {
+  } catch (err) {
     // Parse error or timeout - fail open
+    console.error('[SecurityValidator] main stdin parse:', err);
     console.log(JSON.stringify({ continue: true }));
     return;
   }
